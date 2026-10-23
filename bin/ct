@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""ct - start a Claude task, configured for the job.
+
+    ct new "fix the CSV export bug"                 # in the current repo
+    ct new "add dark mode" --repo ~/projects/my-app
+    ct new "..." --tier risky --model opus          # override the router
+    ct new "..." --dry-run                          # show the decision, don't start
+
+A fast router model (Haiku) reads the task and the repo and picks model, effort and plugins. The tier is "routine"
+unless you say `--tier quick`; the router can only raise it to "risky", never lower it, so a misjudged task still gets
+its packet and independent review. Then the session starts in the background (own worktree) and shows on the dashboard.
+
+Limits (review is the bottleneck): ct refuses to start when max_review (default 2) finished tasks are waiting for
+your review, or max_running (default 4) sessions are working or blocked. --force starts anyway. The limits, and the
+plugins the router may switch on, are in ct.json next to the session board (written by the board's setup); the
+CT_MAX_RUNNING / CT_MAX_REVIEW environment variables override the limits."""
+import argparse, glob, json, os, re, subprocess, sys, tempfile
+
+def board_dir():
+    """same answer as board/csb_paths.find_dir() (ct is installed elsewhere, so it carries a copy; tests/test_paths.py checks they agree)"""
+    if os.environ.get("CSB_DIR"): return os.environ["CSB_DIR"]
+    if os.name == "nt": return os.path.join(os.environ["USERPROFILE"], ".claude", "session-board")
+    try:
+        with open("/proc/version", encoding="utf-8", errors="replace") as f: wsl = "microsoft" in f.read().lower()
+    except OSError: wsl = False
+    for h in (sorted(glob.glob("/mnt/c/Users/*")) if wsl else []):
+        if os.path.isdir(os.path.join(h, ".claude", "session-board", "sessions")): return os.path.join(h, ".claude", "session-board")
+    return os.path.expanduser("~/.claude/session-board")
+
+def config():
+    """ct.json in the session-board folder: {"max_running": 4, "max_review": 2, "plugins": {"name": "plugin@marketplace"}}"""
+    try:
+        with open(os.path.join(board_dir(), "ct.json"), encoding="utf-8") as f: return json.load(f)
+    except Exception:
+        return {}
+
+CFG = config()
+PLUGINS = CFG.get("plugins") or {}       # none unless you list the ones you have installed
+
+SCHEMA = {"type": "object", "required": ["tier", "model", "effort", "plugins", "name", "confidence", "why"], "properties": {
+    "tier": {"type": "string", "enum": ["quick", "routine", "risky"]},
+    "model": {"type": "string", "enum": ["haiku", "sonnet", "opus"]},
+    "effort": {"type": "string", "enum": ["low", "medium", "high"]},
+    "plugins": {"type": "array", "items": {"type": "string", "enum": sorted(PLUGINS) or ["none"]}},
+    "name": {"type": "string", "description": "3-6 word session title"},
+    "confidence": {"type": "number", "description": "0-1, how sure you are about tier and model"},
+    "why": {"type": "string", "description": "one short sentence"}}}
+RULES = """You route coding tasks to the cheapest setup that will do them well.
+tier: quick = one sentence, small reversible diff; routine = normal feature/fix; risky = data, auth, payments, prod/deploy, schema/migrations, deletions, shared infra, or unclear scope.
+model: haiku only for trivial mechanical edits or lookups; sonnet for most coding (default); opus for architecture, hard debugging, large refactors, or risky + ambiguous work.
+effort: low for quick, medium for routine, high for risky or hard reasoning.
+plugins: {PLUGIN_RULE}
+confidence: lower it when the task text is vague."""
+
+def plugin_rule():
+    return ("only what the task needs, from: " + ", ".join(sorted(PLUGINS)) + ". Usually none.") if PLUGINS else "always an empty list."
+
+def repo_facts(repo):
+    f = []
+    pj = os.path.join(repo, "package.json")
+    if os.path.exists(pj):
+        t = open(pj, errors="ignore").read()
+        f.append("frontend (" + ", ".join(k for k in ("next", "react", "vue", "svelte", "vite") if f'"{k}"' in t) + ")" if any(f'"{k}"' in t for k in ("next", "react", "vue", "svelte", "vite")) else "node project")
+    if any(os.path.exists(os.path.join(repo, x)) for x in ("pyproject.toml", "requirements.txt")): f.append("python project")
+    if any(os.path.exists(os.path.join(repo, x)) for x in ("vercel.json", ".vercel", "vercel.ts")): f.append("deployed on Vercel")
+    if os.path.isdir(os.path.join(repo, "supabase")): f.append("uses Supabase")
+    if os.path.exists(os.path.join(repo, "tasks", "FEATURES.json")): f.append("has a feature list")
+    return f or ["unknown stack"]
+
+def route_haiku(task, repo):
+    prompt = f"{RULES.replace('{PLUGIN_RULE}', plugin_rule())}\n\nRepo: {os.path.basename(repo)} - {', '.join(repo_facts(repo))}\nTask: {task}"
+    # no tools: the router decides from the task text and the repo facts above, in seconds instead of exploring the repo
+    r = subprocess.run(["claude", "-p", prompt, "--model", "haiku", "--tools", "", "--output-format", "json", "--no-session-persistence",
+                        "--settings", json.dumps({"disableAllHooks": True}), "--json-schema", json.dumps(SCHEMA)],
+                       capture_output=True, text=True, cwd=tempfile.gettempdir(), timeout=120)
+    d = json.loads(r.stdout or "{}")
+    if d.get("is_error") or not d.get("structured_output"): raise RuntimeError("router failed: " + (r.stderr or r.stdout)[:300])
+    return d["structured_output"]
+
+def to_local(p):
+    m = re.match(r"^([A-Za-z]):[\\/](.*)", p or "")
+    return "/mnt/" + m.group(1).lower() + "/" + m.group(2).replace("\\", "/") if m else os.path.abspath(os.path.expanduser(p))
+
+def board_counts():
+    """(running, to_review) from the session board's files - the same numbers the dashboard header shows"""
+    import time
+    base = board_dir()
+    running = review = 0; now = time.time() * 1000
+    try: hidden = json.load(open(base + "/tui-hidden.json", encoding="utf-8"))
+    except Exception: hidden = {}
+    for f in glob.glob(base + "/sessions/*.json"):
+        try: s = json.load(open(f, encoding="utf-8-sig"))
+        except Exception: continue
+        if s.get("surface") == "chat": continue                          # Desktop chats aren't code tasks
+        if hidden.get(s.get("id")) == (s.get("t") or 0): continue      # hidden on the dashboard with h
+        if s.get("state") in ("working", "needs") and now - (s.get("lastEventAt") or 0) < 3 * 3600000: running += 1
+    # waiting for review = finished work you asked to test yourself (the board's "Test:" items)
+    try: review = sum(1 for i in json.load(open(base + "/delegations.json", encoding="utf-8")).get("items", {}).values() if i.get("state") == "for_review")
+    except Exception: review = 0
+    return running, review
+
+WORK = os.path.expanduser("~/claude-work")
+
+
+def record(item):
+    """add a launch to the board's delegation store (session-board/delegations.json) so it lands in For review"""
+    import time
+    f = os.path.join(board_dir(), "delegations.json")
+    try: data = json.load(open(f, encoding="utf-8"))
+    except Exception: data = {"items": {}}
+    item.setdefault("created", int(time.time() * 1000))
+    data["items"][item["id"]] = item
+    tmp = f + ".tmp"
+    json.dump(data, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1); os.replace(tmp, f)
+
+def find_started(repo, since):
+    """the background session we just started: newest one in this repo since launch (`claude agents --json`)"""
+    import time
+    for _ in range(10):
+        try:
+            r = subprocess.run(["claude", "agents", "--json"], capture_output=True, text=True, timeout=30)
+            mine = [x for x in json.loads(r.stdout or "[]") if x.get("kind") == "background" and x.get("startedAt", 0) >= since - 5000
+                    and os.path.realpath(x.get("cwd", "")).startswith(os.path.realpath(repo))]
+            if mine: return max(mine, key=lambda x: x["startedAt"])
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+def ensure_work():
+    """~/claude-work: the git folder non-code tasks run in (background sessions need a repo)"""
+    if not os.path.isdir(os.path.join(WORK, ".git")):
+        os.makedirs(WORK, exist_ok=True)
+        open(os.path.join(WORK, "README.md"), "w").write("# claude-work\n\nResults of non-code tasks Claude did for you, one folder per task. Managed by the task board.\n")
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=WORK)
+        subprocess.run(["git", "add", "-A"], cwd=WORK); subprocess.run(["git", "commit", "-qm", "claude-work"], cwd=WORK)
+    return WORK
+
+def new(a):
+    if a.kind == "work" and not a.repo: a.repo = ensure_work()
+    repo = to_local(a.repo or os.getcwd())
+    top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    if not top: sys.exit(f"{repo} is not a git repo (background sessions need one for their worktree)")
+    repo = top
+    running, review = board_counts()
+    max_run = int(os.environ.get("CT_MAX_RUNNING") or CFG.get("max_running", 4)); max_rev = int(os.environ.get("CT_MAX_REVIEW") or CFG.get("max_review", 2))
+    if not a.force and not a.dry_run and (review >= max_rev or running >= max_run):
+        why = f"{review} task(s) waiting for you to test" if review >= max_rev else f"{running} sessions already working or blocked"
+        sys.exit(f"not starting: {why}. Review or finish those first, or use --force.")
+    print("routing…", file=sys.stderr)
+    try:
+        d = route_haiku(a.task, repo)
+    except Exception as e:
+        print(f"router unavailable ({e}); using sonnet/medium/routine", file=sys.stderr)
+        d = {"tier": "routine", "model": "sonnet", "effort": "medium", "plugins": [], "name": a.task[:40], "confidence": 1, "why": "fallback"}
+    d["tier"] = a.tier or ("risky" if d.get("tier") == "risky" else "routine")     # router can only raise the tier
+    for k in ("model", "effort"):
+        if getattr(a, k): d[k] = getattr(a, k)
+    print(f"{d['name']}: tier {d['tier']} · {d['model']} · effort {d['effort']} · plugins {', '.join(d['plugins']) or 'none'}  ({d['why']})")
+    if a.dry_run: return
+    first = f"tier: {d['tier']}\n\n{a.task}"
+    if d["tier"] != "quick": first += "\n\nUse the task-intake skill."
+    cmd = ["claude", "--bg", "-n", d["name"], "--model", d["model"], "--effort", d["effort"], "--permission-mode", a.mode]
+    if d["plugins"]: cmd += ["--settings", json.dumps({"enabledPlugins": {PLUGINS[p]: True for p in d["plugins"] if p in PLUGINS}})]
+    import time
+    t0 = int(time.time() * 1000)
+    r = subprocess.run(cmd + [first], cwd=repo, capture_output=True, text=True)
+    out = (r.stdout or r.stderr).strip()
+    if r.returncode != 0:
+        print(out); sys.exit(r.returncode)
+    s = find_started(repo, t0)
+    if s and (a.todoist_id or a.review):      # plain ct / n launches stay ordinary sessions
+        record({"id": s["sessionId"], "bg": s["id"], "title": d["name"], "repo": repo, "kind": a.kind, "tier": d["tier"],
+                "todoist_id": a.todoist_id, "result_dir": a.result_dir, "state": "with_claude", "task": a.task[:2000], "review": a.review or ""})
+    if a.json: print(json.dumps({"ok": True, "bg": s and s["id"], "session": s and s["sessionId"], "name": d["name"], "tier": d["tier"], "model": d["model"]}))
+    else: print(out + "\nstarted - it's on the dashboard; `claude attach <id>` to open it")
+
+def main():
+    ap = argparse.ArgumentParser(prog="ct", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    n = sub.add_parser("new", help="start a task"); n.add_argument("task")
+    n.add_argument("--repo"); n.add_argument("--kind", choices=["code", "work"], default="code", help="work = research/writing/admin, runs in ~/claude-work")
+    n.add_argument("--todoist-id", help=argparse.SUPPRESS); n.add_argument("--result-dir", help=argparse.SUPPRESS); n.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    n.add_argument("--review", help="you'll test the result yourself: what to check (it shows up in your Today list when Claude is done)")
+    n.add_argument("--tier", choices=["quick", "routine", "risky"]); n.add_argument("--model", choices=["haiku", "sonnet", "opus"])
+    n.add_argument("--effort", choices=["low", "medium", "high"]); n.add_argument("--mode", default="auto", help="permission mode (default auto)")
+    n.add_argument("--dry-run", action="store_true"); n.add_argument("--force", action="store_true", help="start even over the running/review limits")
+    n.add_argument("-y", "--yes", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    if a.cmd == "new": new(a)
+
+if __name__ == "__main__":
+    main()

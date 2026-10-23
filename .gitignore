@@ -1,0 +1,11 @@
+# runtime data and secrets stay in the session-board folder, not here
+__pycache__/
+*.pyc
+ntfy.json
+todoist.json
+usage.json
+sessions/
+history/
+plans/
+cloud/feed.json
+tasks/*.tmp
