@@ -58,6 +58,7 @@ class Setup(unittest.TestCase):
         md = rd(self.md)
         self.assertTrue(md.startswith(USER_MD)); self.assertEqual(md.count(su.MARK_START), 1); self.assertNotIn("graphify", md)
         self.assertTrue(os.path.isfile(os.path.join(self.home, ".claude", "skills", "task-intake", "SKILL.md")))
+        self.assertTrue(os.path.isfile(os.path.join(self.home, ".claude", "agents", "task-reviewer.md")))
         self.assertTrue(os.access(os.path.join(self.home, ".local", "bin", "ct"), os.X_OK))
         self.assertEqual(jload(os.path.join(self.board, "ct.json"))["max_running"], 3)
         self.assertEqual(jload(os.path.join(self.board, "todoist.json")), {"token": "tok"})

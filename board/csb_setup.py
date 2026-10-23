@@ -10,7 +10,7 @@ What it can change, and only for the items that were ticked (each is recorded in
 can be undone exactly):
   ~/.claude/settings.json     hook entries and the status line (a timestamped backup is written first)
   ~/.claude/CLAUDE.md         one block between <!-- claude-tasks:start --> and <!-- claude-tasks:end -->
-  ~/.claude/skills/task-intake/SKILL.md, ~/.local/bin/ct
+  ~/.claude/skills/task-intake/SKILL.md, ~/.claude/agents/task-reviewer.md, ~/.local/bin/ct
   <session-board>/            ct.json, todoist.json, ntfy.json, cloud/setup-script.sh
   Claude Desktop's config     the chat add-on (Windows)"""
 import json, os, re, secrets, shlex, shutil, subprocess, sys, time
@@ -65,6 +65,7 @@ def claude_dir(): return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.
 def settings_path(): return os.path.join(claude_dir(), "settings.json")
 def claude_md_path(): return os.path.join(claude_dir(), "CLAUDE.md")
 def skill_path(): return os.path.join(claude_dir(), "skills", "task-intake", "SKILL.md")
+def reviewer_path(): return os.path.join(claude_dir(), "agents", "task-reviewer.md")
 def ct_path(): return os.path.join(os.path.expanduser("~"), ".local", "bin", "ct")
 def state_path(): return os.path.join(data_dir(), "setup.json")
 
@@ -81,7 +82,7 @@ def desktop_config_path():
 def asset(rel):
     """a file shipped with the board: <session-board>/assets/ once installed, the repo's own copy when run from a checkout"""
     here = os.path.dirname(os.path.abspath(__file__))
-    repo = {"rules.md": "../config/rules.md", "task-intake/SKILL.md": "../skills/task-intake/SKILL.md", "ct": "../bin/ct",
+    repo = {"rules.md": "../config/rules.md", "task-intake/SKILL.md": "../skills/task-intake/SKILL.md", "task-intake/task-reviewer.md": "../skills/task-intake/task-reviewer.md", "ct": "../bin/ct",
             "cloud/setup-template.sh": "cloud/setup-template.sh", "cloud/board-report.py": "cloud/board-report.py"}
     for p in (os.path.join(here, "assets", rel), os.path.join(data_dir(), "assets", rel), os.path.join(here, repo.get(rel, rel))):
         if os.path.isfile(p): return p
@@ -295,15 +296,17 @@ def apply(choices, extras=None, st=None, say=print):
         if block and os.path.isfile(claude_md_path()) and MARK_START not in read_raw(claude_md_path()): backup(claude_md_path(), log)
         if set_block(claude_md_path(), block, applied): log.append("CLAUDE.md: " + ("rules block written" if block else "rules block removed"))
 
-    # 3. the task-intake skill
+    # 3. the task-intake skill and the reviewer agent it hands finished work to
     if choices.get("skill"):
-        src, dst = read_text(asset("task-intake/SKILL.md")), skill_path()
-        if not os.path.isfile(dst) or read_text(dst) != src:
-            if os.path.isfile(dst) and not applied.get("skill"): backup(dst, log)
-            write_text(dst, src); log.append("skill: task-intake installed")
+        for rel, dst, what in (("task-intake/SKILL.md", skill_path(), "skill: task-intake"), ("task-intake/task-reviewer.md", reviewer_path(), "agent: task-reviewer")):
+            src = read_text(asset(rel))
+            if not os.path.isfile(dst) or read_text(dst) != src:
+                if os.path.isfile(dst) and not applied.get("skill"): backup(dst, log)
+                write_text(dst, src); log.append(what + " installed")
         applied["skill"] = True
     elif applied.get("skill"):
-        if os.path.isfile(skill_path()): os.remove(skill_path()); log.append("skill: task-intake removed")
+        for dst, what in ((skill_path(), "skill: task-intake"), (reviewer_path(), "agent: task-reviewer")):
+            if os.path.isfile(dst): os.remove(dst); log.append(what + " removed")
         applied["skill"] = False
 
     # 4. ct launcher and its limits

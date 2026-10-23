@@ -5,7 +5,7 @@
 - Stay in scope. Note out-of-scope findings instead of fixing them.
 <!-- rule:tests -->
 ## Tests
-- Never weaken, skip or delete tests to make them pass. If a test is wrong, say so and ask.
+- Never weaken, skip or delete tests, or change an expected value, to make them pass. If tests contradict each other or one looks wrong, say so and ask which behaviour is right.
 <!-- rule:steps -->
 ## Progress tracking (session board)
 - For any task with more than two steps, keep a step list with your task tool (TaskCreate/TaskUpdate, or TodoWrite).

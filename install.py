@@ -24,7 +24,7 @@ def main():
     for f in sorted(os.listdir(os.path.join(HERE, "board"))):
         if f.endswith((".py", ".ps1")) or f == "dashboard.html":
             copy(os.path.join(HERE, "board", f), os.path.join(data, f)); n += 1
-    assets = {"config/rules.md": "rules.md", "skills/task-intake/SKILL.md": "task-intake/SKILL.md", "bin/ct": "ct",
+    assets = {"config/rules.md": "rules.md", "skills/task-intake/SKILL.md": "task-intake/SKILL.md", "skills/task-intake/task-reviewer.md": "task-intake/task-reviewer.md", "bin/ct": "ct",
               "board/cloud/setup-template.sh": "cloud/setup-template.sh", "board/cloud/board-report.py": "cloud/board-report.py"}
     for src, rel in assets.items(): copy(os.path.join(HERE, src), os.path.join(data, "assets", rel)); n += 1
     main_py = os.path.join(data, "csb-tui.py")

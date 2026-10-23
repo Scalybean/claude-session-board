@@ -127,7 +127,7 @@ def changes(sid, cwd):
         now = _hashes(root, [p for p in unc if p in start_dirty])
         unc = {p: st for p, st in unc.items() if p not in start_dirty or now.get(p) != start_dirty[p]}
     files.update(unc)
-    return {"root": root, "head": head or EMPTY_TREE, "commits": commits, "files": sorted((st, p) for p, st in files.items()),
+    return {"root": root, "head": head or EMPTY_TREE, "start": b["head"], "commits": commits, "files": sorted((st, p) for p, st in files.items()),
             "uncommitted": set(unc), "new": new & set(unc)}
 
 def _diff_text(text):

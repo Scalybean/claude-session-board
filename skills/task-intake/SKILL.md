@@ -7,6 +7,8 @@ description: Use when the user hands over a task to run independently or in para
 
 Goal: high-quality autonomous work, human attention only where it matters, and context that survives between sessions.
 
+**Who reads your work:** the user may not read code. They read your plain-language hand-off, decide from it, and sometimes try the result themselves. The independent reviewer agent is the code review, so it has to be strong, and everything you show the user has to make sense without the code.
+
 ## Where knowledge lives
 
 | What | Where | Loaded |
@@ -34,13 +36,13 @@ Audit before changing anything: build and test commands that actually work, stru
 
 ## 1. Size the task first
 
-Pick a tier. When the first prompt has a `tier:` line (from the `ct` launcher) keep it; you may raise it to risky, never lower it. Without one, default to routine; use quick only when the user said so or the change is truly one sentence:
+Pick a tier. When the first prompt names a tier (`ct` starts tasks with a `/goal` message saying "tier: routine"), keep it; you may raise it to risky, never lower it. Without one, default to routine; use quick only when the user said so or the change is truly one sentence:
 
 | Tier | What it is | Packet | Review |
 |---|---|---|---|
 | `quick` | describable as one sentence, one file or a small diff | none; just a step list | self-check + run tests |
 | `routine` | normal feature/fix, reversible | short packet | independent reviewer (step 4) |
-| `risky` | data, auth, money, prod, schema, deletions, shared infra, or unclear scope | full packet, human approves it before work | independent reviewer + human review before merge |
+| `risky` | data, auth, money, prod, schema, deletions, shared infra, or unclear scope | full packet, human approves it before work | independent reviewer + the user approves from your plain summary (and by trying it) before merge |
 
 Do not over-specify small work: no packet, no 16 acceptance criteria for a one-line bug.
 
@@ -49,7 +51,7 @@ Do not over-specify small work: no packet, no 16 acceptance criteria for a one-l
 Ask ONE batched AskUserQuestion round (max 4 questions), tailored to this task; skip what is already known:
 
 1. **Ambiguities that would block or derail the work** - the real forks in this task, not generic questions.
-2. **Acceptance criteria** - propose observable outcomes ("a non-member cannot export", not "export works") and let the user correct them.
+2. **Acceptance criteria** - propose observable outcomes in plain words the user can check without code ("a non-member who clicks Export sees 'not allowed'", not "export works") and let the user correct them.
 3. **Human-review triggers** - propose task-specific options (multiSelect): before merge/deploy/send, destructive or irreversible actions, spending money/quota, external systems or other people, prod data, schema or dependency changes, low confidence, same check failing twice, scope growing past the spec.
 4. **Autonomy** - approve the plan first, or go straight to execution. Plus, only if relevant: whether any new knowledge should also go to the central folder.
 
@@ -69,15 +71,16 @@ decisions: assumptions made, appended as you go
 log: one line per milestone
 ```
 
-**Always create the step list (TaskCreate or TodoWrite) before starting work, including in `claude -p` runs, and keep statuses current.** If no task tool is available, keep the checklist file the plan-nudge hook names (`session-board/plans/<session_id>.md`: `- [ ]`, `- [>]`, `- [x]`). Steps are outcomes in plain words ("Merge PR #15 into main"), never shell commands. The session dashboard's progress bar is computed from this list; without one it shows "no plan". Keep `tasks/FEATURES.json` as a list of `{id, title, acceptance, passes}` since the dashboard shows features passing/total from it.
+**Always create the step list (TaskCreate or TodoWrite) before starting work, including in `claude -p` runs, and keep statuses current.** If no task tool is available, keep the checklist file the plan-nudge hook names (`session-board/plans/<session_id>.md`: `- [ ]`, `- [>]`, `- [x]`). Steps are outcomes in plain words ("Merge PR #15 into main"), never shell commands. The session dashboard's progress bar is computed from this list; without one it shows "no plan". Keep `tasks/FEATURES.json` as a list of `{id, title, acceptance, passes}` since the dashboard shows features passing/total from it. You may add features and flip `passes`; never remove a feature or rewrite an existing one's title or acceptance (the test guard blocks it). If one is wrong, ask the user.
 
-Prefer acceptance checks that are runnable commands (tests, curl, a script); they become the pass/fail gate. For a long unattended run, set `/goal` to "all acceptance checks in tasks/<slug>.md pass" so an independent judge decides when it is done.
+Prefer acceptance checks that are runnable commands (tests, curl, a script); they become the pass/fail gate. Tasks started by `ct` already run under a `/goal` that a separate check evaluates after every turn; it counts as met only when the checks pass with evidence, the reviewer verdict is recorded and the hand-off is written, or when you have asked the user a blocking question. Elsewhere, for a long unattended run, the user can set `/goal` the same way.
 
 For risky tasks, the human approves the packet (especially acceptance) before execution. Create native tasks (TaskCreate) for the steps with `addBlockedBy` ordering, one in_progress at a time.
 
 ## 3. Execute in isolation
 
 - Code: background sessions (`claude --bg`, `ct new`) already get their own worktree; otherwise use `claude --worktree <slug>` or `isolation: worktree` for subagents. Never the main branch directly. Commit after each step, and end every session in a mergeable state.
+- Worktrees isolate files, not the network or databases. Use the port and scratch database the task was given (`ct` names them in the first message), never a default port like 3000 or a shared dev database. Leave the files in `tasks/shared-files.txt` alone while other tasks may be running; if you must change one, ask first.
 - For unclear tasks, a cheap scout attempt first is fine: try, learn where the hard parts are, then throw it away and write the packet.
 - One feature or task at a time; do not start the next until the current one is verified.
 - Non-code outputs go under `tasks/<slug>/`.
@@ -87,8 +90,8 @@ For risky tasks, the human approves the packet (especially acceptance) before ex
 ## 4. Verify (a gate, not a self-report)
 
 1. Run every `check:` and the definition of done. Paste the real output (trimmed) into the packet as evidence; never claim a pass you did not run.
-2. Never delete, skip or loosen tests to get green. If a test is wrong, stop and make it a review trigger. (A Stop hook flags new skips and deleted tests.)
-3. **Independent review** (routine and risky): spawn a fresh reviewer that sees only the diff (`git diff <base>...HEAD`) and the packet's goal + acceptance, not this conversation. Use `/code-review`, or a subagent with this brief: "Review this diff against these acceptance criteria. Flag only problems that break correctness or a stated requirement; no style or nice-to-haves." Fix what it finds, or record why not.
+2. Never delete, skip or loosen tests, or change an expected value, to get green. If two tests or acceptance checks contradict each other, or a test looks wrong, stop and ask the user which behaviour is right (status: needs-human). That is a decision, not a fix. If the task really asked for different behaviour, say so in `decisions` and in the hand-off. (A Stop hook flags new skips, deleted tests and changed assertions.)
+3. **Independent review** (routine and risky): spawn the `task-reviewer` agent (if it isn't installed, a fresh subagent with the same brief). Give it only the diff command (`git diff <base>...HEAD`) and the packet's goal and acceptance, never this conversation. It runs the checks itself, reads every test change, and flags only problems that break correctness or a stated requirement. Fix what it finds and run it again, or record why not.
 4. Record the result in the packet as two lines, `reviewer: pass | fixed: <what> | open: <what>` and `evidence: <checks run and result>`. A Stop hook (review gate) blocks marking a routine/risky packet `review`/`done` without them.
 5. Mark a feature `passes:true` in `FEATURES.json` only after this. Two failures of the same check is a review trigger.
 
@@ -103,6 +106,13 @@ When a trigger fires or you are blocked:
 
 ## 6. Hand off (every session end)
 
-**Code tasks end with a pull request** (routine and risky): work on the task's own branch (background sessions already have one), push that branch, and open a PR with `gh pr create`: title = the outcome, body = goal, acceptance with evidence, reviewer verdict, what's unverified, and the packet path. Never push task work straight to main/master; a push guard asks the user first if you try. The dashboard shows the PR's state and checks.
+**Code tasks end with a pull request** (routine and risky): work on the task's own branch (background sessions already have one), push that branch, and open a PR with `gh pr create`: title = the outcome, body = the hand-off below, then acceptance with evidence, reviewer verdict, and the packet path. The PR is the record and runs CI. The user decides from the hand-off, not from the diff. Never push task work straight to main/master; a push guard asks the user first if you try. The dashboard shows the PR's state and checks.
 
-Append to `tasks/PROGRESS.md` (the session record; there is no activity log anymore). Keep it short: when it has more than 10 entries, fold the oldest into a few lines under `## Earlier` at the top. date, tier, what was done (specific, outcome-first, since this feeds the notification text), evidence (checks run + result, reviewer verdict), decisions and why, what is next, what is unverified or risky, diff size. Update `docs/` and `docs/decisions/` for anything durable; keep CLAUDE.md for rules only. Set the packet to `done` or leave it `running` with a clear next step. Set packet `status: review` when it waits for the human. Final reply: 3-5 lines on what was produced, where it is, and what still needs the human.
+Append to `tasks/PROGRESS.md` (the session record; there is no activity log anymore). Keep it short: when it has more than 10 entries, fold the oldest into a few lines under `## Earlier` at the top. date, tier, what was done (specific, outcome-first, since this feeds the notification text), evidence (checks run + result, reviewer verdict), decisions and why, what is next, what is unverified or risky, diff size. Update `docs/` and `docs/decisions/` for anything durable; keep CLAUDE.md for rules only. Set the packet to `done` or leave it `running` with a clear next step. Set packet `status: review` when it waits for the human.
+
+**The hand-off** (final reply, and the top of the PR body). Plain words, no code, no file paths unless the user needs to open one:
+- **What changed:** what the user will notice, in one to three sentences.
+- **How to try it:** numbered steps the user can follow by hand: what to run or open, what to click, what they should see.
+- **Checked:** the acceptance checks that passed, and the reviewer's verdict, in a line each.
+- **Not checked / risks:** what nobody verified, and anything that could surprise them.
+- **Needs you:** the decision or test still waiting on the user, if any.

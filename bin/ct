@@ -10,6 +10,12 @@ A fast router model (Haiku) reads the task and the repo and picks model, effort 
 unless you say `--tier quick`; the router can only raise it to "risky", never lower it, so a misjudged task still gets
 its packet and independent review. Then the session starts in the background (own worktree) and shows on the dashboard.
 
+The first message is a /goal: after every turn a separate check decides whether the task is really finished (acceptance
+checks pass with evidence, reviewer verdict recorded, hand-off written) or blocked on a question for you, and Claude keeps
+working until one is true. Each task also gets its own port and scratch-database name (worktrees isolate files, not the
+network or a shared database), and the repo's tasks/shared-files.txt (one path or glob per line) lists files no parallel
+task may edit without asking.
+
 Limits (review is the bottleneck): ct refuses to start when max_review (default 2) finished tasks are waiting for
 your review, or max_running (default 4) sessions are working or blocked. --force starts anyway. The limits, and the
 plugins the router may switch on, are in ct.json next to the session board (written by the board's setup); the
@@ -100,6 +106,52 @@ def board_counts():
     return running, review
 
 WORK = os.path.expanduser("~/claude-work")
+GOAL_MAX = 4000          # Claude Code's limit on a /goal condition
+
+def take_port(name):
+    """a port no other recent ct task holds, 4100-4899, remembered in <session-board>/ct-ports.json for 3 days"""
+    import time
+    f = os.path.join(board_dir(), "ct-ports.json"); now = time.time()
+    try:
+        import fcntl
+        lock = open(f + ".lock", "w"); fcntl.flock(lock, fcntl.LOCK_EX)       # held until ct exits; two launches at once get two ports
+    except Exception:
+        pass
+    try: held = {int(k): v for k, v in json.load(open(f, encoding="utf-8")).items() if now - v.get("at", 0) < 3 * 86400}
+    except Exception: held = {}
+    port = next(p for p in range(4100, 4900) if p not in held)
+    held[port] = {"task": name, "at": now}
+    try:
+        tmp = f + ".tmp"; json.dump({str(k): v for k, v in held.items()}, open(tmp, "w", encoding="utf-8")); os.replace(tmp, f)
+    except OSError:
+        pass
+    return port
+
+def shared_files(repo):
+    try:
+        with open(os.path.join(repo, "tasks", "shared-files.txt"), encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+    except OSError:
+        return []
+
+def goal_message(task, tier, port, db, shared):
+    """the session's first message: a /goal whose condition carries the task, so the goal check and the work start together"""
+    lane = (f"\n\nParallel work: other tasks may run at the same time. Use port {port} for any server you start and a scratch "
+            f"database named {db}; never a port or database another task might use.")
+    if shared: lane += " Don't edit these shared files without asking the user first: " + ", ".join(shared[:20]) + "."
+    if tier == "quick":
+        done = "the change is made, the tests pass (run them), and you told the user in plain words what changed and how to try it."
+    else:
+        done = ("you followed the task-intake skill: the packet in tasks/<slug>.md has every acceptance check passing with its real "
+                "output as evidence, an independent reviewer's verdict is recorded, for code the branch is pushed with a PR open, and "
+                "the hand-off is written in plain words (what changed for the user, how to try it, what was not checked).")
+    head = f"/goal Task (tier: {tier}){'' if tier == 'quick' else ', use the task-intake skill'}:\n"
+    tail = (f"{lane}\n\nThis goal is met when {done} It is also met when you are blocked on a decision only the user can make "
+            "and have asked it in this session (packet status: needs-human). If tests or acceptance checks contradict each other, "
+            "that is such a decision: ask, never edit a test to match.")
+    room = GOAL_MAX - len(head) - len(tail) - 40
+    body = task if len(task) <= room else task[:room] + " [...cut: ask the user for the rest]"
+    return head + body + tail
 
 
 def record(item):
@@ -158,8 +210,8 @@ def new(a):
         if getattr(a, k): d[k] = getattr(a, k)
     print(f"{d['name']}: tier {d['tier']} · {d['model']} · effort {d['effort']} · plugins {', '.join(d['plugins']) or 'none'}  ({d['why']})")
     if a.dry_run: return
-    first = f"tier: {d['tier']}\n\n{a.task}"
-    if d["tier"] != "quick": first += "\n\nUse the task-intake skill."
+    port = take_port(d["name"]); db = "task_" + re.sub(r"[^a-z0-9]+", "_", d["name"].lower()).strip("_")[:40]
+    first = goal_message(a.task, d["tier"], port, db, shared_files(repo))
     cmd = ["claude", "--bg", "-n", d["name"], "--model", d["model"], "--effort", d["effort"], "--permission-mode", a.mode]
     if d["plugins"]: cmd += ["--settings", json.dumps({"enabledPlugins": {PLUGINS[p]: True for p in d["plugins"] if p in PLUGINS}})]
     import time

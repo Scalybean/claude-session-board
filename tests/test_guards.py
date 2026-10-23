@@ -103,6 +103,48 @@ class TestGuard(Base):
         cs.budget(0)
         try: self.assertEqual(cs.git(self.repo, "status"), "")
         finally: cs._deadline = None
+    def test_an_edited_expected_value_blocks(self):
+        self.write(self.repo, "tests/test_calc.py", "def test_total():\n    assert total([1, 2]) == 3\n")
+        sh(self.repo, "git", "add", "-A"); sh(self.repo, "git", "commit", "-qm", "calc")
+        self.start("c1"); self.write(self.repo, "tests/test_calc.py", "def test_total():\n    assert total([1, 2]) == 4\n")
+        out = self.stop(self.G, "c1"); self.assertIn("assertion(s) or expected value(s) changed or removed", out["reason"]); self.assertIn("== 3", out["reason"])
+        self.assertIn("stop and ask", out["reason"])
+    def test_a_loosened_assertion_blocks_but_a_new_one_or_a_comment_is_fine(self):
+        self.write(self.repo, "tests/test_calc.py", "def test_total():\n    # should add up\n    assert total([1, 2]) == 3\n")
+        sh(self.repo, "git", "add", "-A"); sh(self.repo, "git", "commit", "-qm", "calc")
+        self.start("c2")
+        self.write(self.repo, "tests/test_calc.py", "def test_total():\n    assert total([1, 2]) == 3\n    assert total([]) == 0\n")
+        self.assertIsNone(self.stop(self.G, "c2"))                       # comment dropped, assertion added: fine
+        self.write(self.repo, "tests/test_calc.py", "def test_total():\n    assert total([1, 2])\n    assert total([]) == 0\n")
+        self.assertEqual(self.stop(self.G, "c2")["decision"], "block")
+    def test_expected_values_on_their_own_line_count_too(self):
+        cases = {
+            "multi-line": ("def test_t():\n    self.assertEqual(\n        total([1, 2]),\n        3,\n    )\n", "3,", "4,"),
+            "parametrize": ("@pytest.mark.parametrize('xs,want', [([1, 2], 3)])\ndef test_t(xs, want):\n    assert total(xs) == want\n", "3)]", "4)]"),
+            "variable": ("def test_t():\n    expected = 3\n    assert total([1, 2]) == expected\n", "= 3", "= 4"),
+            "string first": ("def test_t():\n    log('assert'); assert total([1, 2]) == 3\n", "== 3", "== 4"),
+        }
+        for i, (name, (text, old, new)) in enumerate(cases.items()):
+            self.write(self.repo, f"tests/test_v{i}.py", text); sh(self.repo, "git", "add", "-A"); sh(self.repo, "git", "commit", "-qm", name)
+            sid = f"v{i}"; self.start(sid)
+            self.write(self.repo, f"tests/test_v{i}.py", text.replace(old, new))
+            out = self.stop(self.G, sid); self.assertIsNotNone(out, name); self.assertIn("expected value", out["reason"], name)
+            sh(self.repo, "git", "checkout", "-q", "--", "."); 
+    def test_renaming_an_import_or_reindenting_is_fine(self):
+        self.write(self.repo, "tests/test_r.py", "import os\ndef test_r():\n    assert 1 + 1 == 2\n"); sh(self.repo, "git", "add", "-A"); sh(self.repo, "git", "commit", "-qm", "r")
+        self.start("r1"); self.write(self.repo, "tests/test_r.py", "import sys\n\ndef test_r():\n        assert 1 + 1 == 2\n")
+        self.assertIsNone(self.stop(self.G, "r1"))
+    def test_feature_list_only_gains_features_and_flips_passes(self):
+        feats = [{"id": "f1", "title": "Export", "acceptance": "a non-member cannot export", "passes": False}]
+        self.write(self.repo, "tasks/FEATURES.json", json.dumps(feats)); sh(self.repo, "git", "add", "-A"); sh(self.repo, "git", "commit", "-qm", "f")
+        self.start("f1")
+        ok = [dict(feats[0], passes=True), {"id": "f2", "title": "New", "acceptance": "x", "passes": False}]
+        self.write(self.repo, "tasks/FEATURES.json", json.dumps(ok)); self.assertIsNone(self.stop(self.G, "f1"))
+        bad = [dict(feats[0], acceptance="export works", passes=True)]
+        self.write(self.repo, "tasks/FEATURES.json", json.dumps(bad))
+        out = self.stop(self.G, "f1"); self.assertIn("acceptance was rewritten", out["reason"])
+        self.write(self.repo, "tasks/FEATURES.json", "[]")
+        self.assertIn("feature f1 removed", self.stop(self.G, "f1")["reason"])
     def test_js_only_blocks(self):
         self.start(); self.write(self.repo, "tests/a.test.js", "it.only('x', () => {})\n")
         self.assertEqual(self.stop(self.G)["decision"], "block")
